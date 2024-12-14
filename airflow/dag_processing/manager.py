@@ -68,7 +68,7 @@ from airflow.utils.process_utils import (
 from airflow.utils.retries import retry_db_transaction
 from airflow.utils.session import NEW_SESSION, provide_session
 from airflow.utils.sqlalchemy import prohibit_commit, with_row_locks
-
+from airflow.dag_processing.collection import collect_dag_results
 if TYPE_CHECKING:
     from multiprocessing.connection import Connection as MultiprocessingConnection
 
@@ -905,14 +905,14 @@ class DagFileProcessorManager(LoggingMixin):
             last_num_of_db_queries = 0
 
         last_duration = (last_finish_time - processor.start_time).total_seconds()
-        stat = DagFileStat(
-            num_dags=num_dags,
-            import_errors=count_import_errors,
-            last_finish_time=last_finish_time,
-            last_duration=last_duration,
+        collection_result = collect_dag_results(
+            run_duration=last_duration,
+            finish_time=last_finish_time,
             run_count=self._file_stats[processor.file_path].run_count + 1,
-            last_num_of_db_queries=last_num_of_db_queries,
+
         )
+        stat = collection_result.stat
+        stat.num_of_db_queries = last_num_of_db_queries,
         self._file_stats[processor.file_path] = stat
         file_name = Path(processor.file_path).stem
         """crude exposure of instrumentation code which may need to be furnished"""

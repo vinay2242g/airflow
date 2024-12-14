@@ -30,13 +30,18 @@ from __future__ import annotations
 import itertools
 import logging
 import traceback
-from typing import TYPE_CHECKING, NamedTuple
+from datetime import datetime
+from pathlib import Path
+from typing import NamedTuple
+from typing import TYPE_CHECKING
 
 from sqlalchemy import and_, delete, exists, func, select, tuple_
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import joinedload, load_only
 
 from airflow.assets.manager import asset_manager
+from airflow.dag_processing.messaging import DagFileParsingResult, DagFileStat, \
+    CollectionResult
 from airflow.models.asset import (
     AssetActive,
     AssetAliasModel,
@@ -45,12 +50,14 @@ from airflow.models.asset import (
     DagScheduleAssetReference,
     TaskOutletAssetReference,
 )
-from airflow.models.dag import DAG, DagModel, DagOwnerAttributes, DagTag
+from airflow.models.dag import DAG
+from airflow.models.dag import DagModel, DagOwnerAttributes, DagTag
 from airflow.models.dagrun import DagRun
 from airflow.models.dagwarning import DagWarningType
 from airflow.models.errors import ParseImportError
 from airflow.models.trigger import Trigger
 from airflow.sdk.definitions.asset import Asset, AssetAlias
+from airflow.stats import Stats
 from airflow.triggers.base import BaseTrigger
 from airflow.utils.retries import MAX_DB_RETRIES, run_with_db_retries
 from airflow.utils.sqlalchemy import with_row_locks
@@ -59,6 +66,7 @@ from airflow.utils.types import DagRunType
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable, Iterator
+    from datetime import datetime
 
     from sqlalchemy.orm import Session
     from sqlalchemy.sql import Select
@@ -67,6 +75,41 @@ if TYPE_CHECKING:
     from airflow.typing_compat import Self
 
 log = logging.getLogger(__name__)
+
+
+def collect_dag_results(
+    run_duration: float,
+    finish_time: datetime,
+    run_count: int,
+    path: str,
+    parsing_result: DagFileParsingResult | None,
+):
+    stat = DagFileStat(
+        last_finish_time=finish_time,
+        last_duration=run_duration,
+        run_count=run_count + 1,
+    )
+
+    file_name = Path(path).stem
+    Stats.timing(f"dag_processing.last_duration.{file_name}", stat.last_duration)
+    Stats.timing("dag_processing.last_duration", stat.last_duration, tags={"file_name": file_name})
+
+    if parsing_result is None:
+        stat.import_errors = 1
+        collected_dags = []
+        import_errors = {}
+    else:
+        # record DAGs and import errors to database
+        collected_dags = parsing_result.serialized_dags or []
+        import_errors = parsing_result.import_errors or {}
+        stat.num_dags = len(parsing_result.serialized_dags)
+        if parsing_result.import_errors:
+            stat.import_errors = len(parsing_result.import_errors)
+    return CollectionResult(
+        stat=stat,
+        collected_dags=collected_dags,
+        import_errors=import_errors,
+    )
 
 
 def _create_orm_dags(dags: Iterable[DAG], *, session: Session) -> Iterator[DagModel]:

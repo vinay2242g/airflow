@@ -23,7 +23,7 @@ import signal
 import threading
 import time
 import zipfile
-from collections.abc import Generator, Iterable
+from collections.abc import Generator
 from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -50,8 +50,16 @@ from airflow.utils.log.logging_mixin import LoggingMixin, StreamLogWriter, set_c
 from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.session import NEW_SESSION, provide_session
 from airflow.utils.state import TaskInstanceState
+from airflow.dag_processing.messaging import DagFileParseRequest, DagInfo, DagFileParsingResult
+from airflow.serialization.serialized_objects import SerializedDAG
+import traceback
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from datetime import datetime
+
+    from sqlalchemy.orm import Session
+
     import multiprocessing
     from datetime import datetime
     from multiprocessing.connection import Connection as MultiprocessingConnection
@@ -60,6 +68,7 @@ if TYPE_CHECKING:
 
     from airflow.callbacks.callback_requests import CallbackRequest
     from airflow.models.operator import Operator
+    from airflow.utils.context import Context
 
 
 @dataclass
@@ -82,6 +91,79 @@ def count_queries(session: Session) -> Generator[_QueryCounter, None, None]:
 
     yield counter
     event.remove(session, "do_orm_execute", _count_db_queries)
+
+
+def _parse_file(msg: DagFileParseRequest, log):
+    bag = DagBag(
+        dag_folder=msg.file,
+        include_examples=False,
+        safe_mode=True,
+        load_op_links=False,
+    )
+    serialized_dags, serialization_import_errors = serialize_dags(bag, log)
+    bag.import_errors.update(serialization_import_errors)
+    dags = [DagInfo(data=serdag) for serdag in serialized_dags]
+    result = DagFileParsingResult(
+        fileloc=msg.file,
+        serialized_dags=dags,
+        import_errors=bag.import_errors,
+    )
+
+    if msg.callback_requests:
+        _execute_callbacks(bag, msg.callback_requests, log)
+    return result
+
+
+def serialize_dags(bag, log):
+    serialization_import_errors = {}
+    serialized_dags = []
+    for dag in bag.dags.values():
+        try:
+            serialized_dag = SerializedDAG.to_dict(dag)
+            serialized_dags.append(serialized_dag)
+        except Exception:
+            log.exception("Failed to write serialized DAG: %s", dag.fileloc)
+            dagbag_import_error_traceback_depth = conf.getint("core", "dagbag_import_error_traceback_depth")
+            serialization_import_errors[dag.fileloc] = traceback.format_exc(
+                limit=-dagbag_import_error_traceback_depth
+            )
+    return serialized_dags, serialization_import_errors
+
+
+def _execute_callbacks(dagbag: DagBag, callback_requests: list[CallbackRequest], log):
+    for request in callback_requests:
+        log.debug("Processing Callback Request", request=request)
+        if isinstance(request, TaskCallbackRequest):
+            raise NotImplementedError("Haven't coded Task callback yet!")
+            # _execute_task_callbacks(dagbag, request)
+        elif isinstance(request, DagCallbackRequest):
+            _execute_dag_callbacks(dagbag, request, log)
+
+
+def _execute_dag_callbacks(dagbag: DagBag, request: DagCallbackRequest, log):
+    dag = dagbag.dags[request.dag_id]
+
+    callbacks = dag.on_failure_callback if request.is_failure_callback else dag.on_success_callback
+    if not callbacks:
+        log.warning("Callback requested, but dag didn't have any", dag_id=request.dag_id)
+        return
+
+    callbacks = callbacks if isinstance(callbacks, list) else [callbacks]
+    # TODO:We need a proper context object!
+    context: Context = {}
+
+    for callback in callbacks:
+        log.info(
+            "Executing on_%s dag callback",
+            "failure" if request.is_failure_callback else "success",
+            fn=callback,
+            dag_id=request.dag_id,
+        )
+        try:
+            callback(context)
+        except Exception:
+            log.exception("Callback failed", dag_id=request.dag_id)
+            Stats.incr("dag.callback_exceptions", tags={"dag_id": request.dag_id})
 
 
 class DagFileProcessorProcess(LoggingMixin, MultiprocessingStartMethodMixin):
@@ -167,6 +249,13 @@ class DagFileProcessorProcess(LoggingMixin, MultiprocessingStartMethodMixin):
 
             log.info("Started process (PID=%s) to work on %s", os.getpid(), file_path)
             dag_file_processor = DagFileProcessor(dag_directory=dag_directory, log=log)
+            _parse_file(
+                DagFileParseRequest(
+                    file=file_path,
+                    callback_requests=callback_requests,
+                ),
+                log=log
+            )
             result: tuple[int, int, int] = dag_file_processor.process_file(
                 file_path=file_path,
                 callback_requests=callback_requests,
